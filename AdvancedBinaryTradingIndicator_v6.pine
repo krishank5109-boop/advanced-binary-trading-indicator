@@ -1,0 +1,483 @@
+//@version=6
+indicator("Advanced Binary Trading Indicator v6", overlay=true, max_labels_count=200, max_lines_count=200, max_boxes_count=200)
+
+// ============================================================================
+// 1) GLOBAL SETTINGS
+// ============================================================================
+
+showEma = input.bool(true, "Show EMA lines", group="Moving Average")
+ema13Len = input.int(13, "EMA 13", minval=1, group="Moving Average")
+ema34Len = input.int(34, "EMA 34", minval=1, group="Moving Average")
+ema200Len = input.int(200, "EMA 200", minval=1, group="Moving Average")
+ema200Filter = input.bool(true, "Use EMA 200 trend filter", group="Moving Average")
+
+showFvg = input.bool(true, "Show FVG zones", group="Fair Value Gap")
+fvgMinSize = input.float(0.0, "Minimum FVG size", minval=0.0, step=0.0001, group="Fair Value Gap")
+fvgExtend = input.int(20, "FVG extend bars", minval=1, maxval=100, group="Fair Value Gap")
+fvgRetestFilter = input.bool(false, "Require FVG retest for signal", group="Fair Value Gap")
+
+showPoi = input.bool(true, "Show POI / imbalance zones", group="POI and Imbalance")
+poiMinDisp = input.float(0.0, "Minimum displacement filter", minval=0.0, step=0.0001, group="POI and Imbalance")
+poiExtend = input.int(35, "POI zone extend bars", minval=1, maxval=100, group="POI and Imbalance")
+
+showLiquidity = input.bool(true, "Show liquidity analysis", group="Liquidity")
+liqLeft = input.int(5, "Liquidity pivot left", minval=1, maxval=50, group="Liquidity")
+liqRight = input.int(5, "Liquidity pivot right", minval=1, maxval=50, group="Liquidity")
+liqTolerance = input.float(0.0, "Equal high/low tolerance", minval=0.0, step=0.0001, group="Liquidity")
+liqSweepLookback = input.int(20, "Sweep lookback", minval=1, maxval=200, group="Liquidity")
+
+showStructure = input.bool(true, "Show structure labels", group="Market Structure")
+msPivotLeft = input.int(5, "Swing left", minval=1, maxval=50, group="Market Structure")
+msPivotRight = input.int(5, "Swing right", minval=1, maxval=50, group="Market Structure")
+msbLookback = input.int(2, "MSB lookback", minval=1, maxval=20, group="Market Structure")
+chochLookback = input.int(2, "CHOCH lookback", minval=1, maxval=20, group="Market Structure")
+
+useOiFilter = input.bool(false, "Enable OI confirmation filter", group="Open Interest")
+oiSymbol = input.string("", "OI symbol override (blank = auto)", group="Open Interest")
+oiLookback = input.int(10, "OI confirmation lookback", minval=1, maxval=100, group="Open Interest")
+oiMode = input.string("mixed", "OI mode", options=["off", "bullish_only", "bearish_only", "mixed"], group="Open Interest")
+
+signalMode = input.string("confluence", "Signal mode", options=["confluence", "simple"], group="Signal Logic")
+requireTrend = input.bool(true, "Require trend filter for signal", group="Signal Logic")
+requireBullishStructure = input.bool(true, "Require bullish structure for BUY", group="Signal Logic")
+requireBearishStructure = input.bool(true, "Require bearish structure for SELL", group="Signal Logic")
+requireFvgConfirm = input.bool(true, "Require FVG / imbalance confirmation", group="Signal Logic")
+requireLiquidityConfirm = input.bool(true, "Require liquidity confirmation", group="Signal Logic")
+allowPoiReturn = input.bool(true, "Allow POI / imbalance return", group="Signal Logic")
+minSignalBars = input.int(2, "Minimum confirmed bars before signal", minval=1, maxval=20, group="Signal Logic")
+
+showRiskLevels = input.bool(true, "Show risk / trade reference levels", group="Risk / Trade")
+atrLen = input.int(14, "ATR length", minval=1, group="Risk / Trade")
+atrStopMult = input.float(1.5, "ATR stop multiplier", minval=0.1, step=0.1, group="Risk / Trade")
+riskReward = input.float(1.0, "Risk:Reward ratio", minval=0.1, maxval=10.0, step=0.1, group="Risk / Trade")
+breakEvenOffset = input.float(0.0, "Break-even offset in ATR units", minval=0.0, step=0.1, group="Risk / Trade")
+entryMode = input.string("close", "Entry reference", options=["close", "open", "hlc3"], group="Risk / Trade")
+showLevelLabels = input.bool(true, "Show level labels", group="Risk / Trade")
+
+tradeExpiryBars = input.int(3, "Binary expiry in candles", minval=1, maxval=50, group="Binary Expiry")
+expiryReference = input.string("close", "Expiry reference", options=["close", "open", "high", "low"], group="Binary Expiry")
+showExpiryLabels = input.bool(true, "Show expiry outcome labels", group="Binary Expiry")
+
+showPanel = input.bool(true, "Show status panel", group="Display")
+
+alertBuy = input.bool(true, "BUY/CALL alert", group="Alerts")
+alertSell = input.bool(true, "SELL/PUT alert", group="Alerts")
+
+// ============================================================================
+// 2) HELPER FUNCTIONS
+// ============================================================================
+
+entryPrice() =>
+    entryMode == "close" ? close :
+    entryMode == "open" ? open :
+    hlc3
+
+expiryPrice() =>
+    expiryReference == "close" ? close :
+    expiryReference == "open" ? open :
+    expiryReference == "high" ? high :
+    low
+
+// ============================================================================
+// 3) core EMA values
+// ============================================================================
+
+ema13 = ta.ema(close, ema13Len)
+ema34 = ta.ema(close, ema34Len)
+ema200 = ta.ema(close, ema200Len)
+atr = ta.atr(atrLen)
+
+bullTrend = ema13 > ema34
+bearTrend = ema13 < ema34
+bullTrend200 = ema200 > ema200[1]
+bearTrend200 = ema200 < ema200[1]
+trendBull = requireTrend ? (bullTrend and (not ema200Filter or bullTrend200)) : bullTrend
+trendBear = requireTrend ? (bearTrend and (not ema200Filter or bearTrend200)) : bearTrend
+
+// ============================================================================
+// 4) MARKET STRUCTURE
+// ============================================================================
+
+pivotHigh = ta.pivothigh(high, msPivotLeft, msPivotRight)
+pivotLow = ta.pivotlow(low, msPivotLeft, msPivotRight)
+
+bullishBOS = false
+bearishBOS = false
+bullishMSB = false
+bearishMSB = false
+bullishCHOCH = false
+bearishCHOCH = false
+
+if bar_index > msPivotRight + 1
+    recentHigh = ta.highest(high, msPivotRight + 1)
+    recentLow = ta.lowest(low, msPivotRight + 1)
+    recentHighPrev = ta.highest(high, msPivotRight + 1)[1]
+    recentLowPrev = ta.lowest(low, msPivotRight + 1)[1]
+
+    if high > recentHighPrev and close > recentHighPrev
+        bullishBOS := true
+    if low < recentLowPrev and close < recentLowPrev
+        bearishBOS := true
+
+    if close > ta.highest(high, msbLookback + 1)[1]
+        bullishMSB := true
+    if close < ta.lowest(low, msbLookback + 1)[1]
+        bearishMSB := true
+
+    if close > ta.highest(high, chochLookback + 1)[1] and close > open
+        bullishCHOCH := true
+    if close < ta.lowest(low, chochLookback + 1)[1] and close < open
+        bearishCHOCH := true
+
+marketBullStructure = bullishBOS or bullishMSB or bullishCHOCH
+marketBearStructure = bearishBOS or bearishMSB or bearishCHOCH
+
+if showStructure and barstate.isconfirmed
+    if bullishBOS
+        label.new(bar_index, low, "BOS↑", yloc=yloc.belowbar, textcolor=color.white, color=color.new(color.green, 0), style=label.style_label_down, size=size.tiny)
+    if bearishBOS
+        label.new(bar_index, high, "BOS↓", yloc=yloc.abovebar, textcolor=color.white, color=color.new(color.red, 0), style=label.style_label_up, size=size.tiny)
+    if bullishMSB
+        label.new(bar_index, low, "MSB↑", yloc=yloc.belowbar, color=color.new(color.lime, 0), textcolor=color.black, style=label.style_label_down, size=size.tiny)
+    if bearishMSB
+        label.new(bar_index, high, "MSB↓", yloc=yloc.abovebar, color=color.new(color.maroon, 0), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    if bullishCHOCH
+        label.new(bar_index, low, "CHOCH↑", yloc=yloc.belowbar, color=color.new(color.aqua, 0), textcolor=color.black, style=label.style_label_down, size=size.tiny)
+    if bearishCHOCH
+        label.new(bar_index, high, "CHOCH↓", yloc=yloc.abovebar, color=color.new(color.orange, 0), textcolor=color.black, style=label.style_label_up, size=size.tiny)
+
+// ============================================================================
+// 5) LIQUIDITY SWEEPS, EQUAL HIGHS / LOWS
+// ============================================================================
+
+liquidityBullSweep = false
+liquidityBearSweep = false
+
+aRecentHigh = ta.highest(high, liqSweepLookback)
+aRecentLow = ta.lowest(low, liqSweepLookback)
+
+if barstate.isconfirmed
+    if high > aRecentHigh and close < aRecentHigh
+        liquidityBullSweep := true
+    if low < aRecentLow and close > aRecentLow
+        liquidityBearSweep := true
+
+if showLiquidity and not na(pivotHigh)
+    line.new(bar_index - liqRight, pivotHigh, bar_index, pivotHigh, color=color.new(color.gray, 0), style=line.style_dashed, extend=extend.right)
+if showLiquidity and not na(pivotLow)
+    line.new(bar_index - liqRight, pivotLow, bar_index, pivotLow, color=color.new(color.gray, 0), style=line.style_dashed, extend=extend.right)
+
+if liquidityBullSweep
+    label.new(bar_index, aRecentHigh, "Buy Liquidity Sweep", yloc=yloc.abovebar, color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+if liquidityBearSweep
+    label.new(bar_index, aRecentLow, "Sell Liquidity Sweep", yloc=yloc.belowbar, color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+// Equal highs/lows
+if showLiquidity
+    equalHigh = false
+    equalLow = false
+    for i = 1 to 20
+        if math.abs(high - high[i]) <= liqTolerance and high > high[i]
+            equalHigh := true
+        if math.abs(low - low[i]) <= liqTolerance and low < low[i]
+            equalLow := true
+    if equalHigh
+        label.new(bar_index, high, "EQH", yloc=yloc.abovebar, color=color.new(color.yellow, 0), textcolor=color.black, style=label.style_label_left, size=size.tiny)
+    if equalLow
+        label.new(bar_index, low, "EQL", yloc=yloc.belowbar, color=color.new(color.yellow, 0), textcolor=color.black, style=label.style_label_left, size=size.tiny)
+
+// ============================================================================
+// 6) FVG (three-candle gap)
+// ============================================================================
+
+var float[] bullFvgTop = array.new_float()
+var float[] bullFvgBot = array.new_float()
+var float[] bullFvgFilled = array.new_float()
+var float[] bearFvgTop = array.new_float()
+var float[] bearFvgBot = array.new_float()
+var float[] bearFvgFilled = array.new_float()
+
+bullFvg = false
+bearFvg = false
+fvgBullRetest = false
+fvgBearRetest = false
+
+bullFvg = (low > high[2]) and (close > high[2])
+bearFvg = (high < low[2]) and (close < low[2])
+
+if showFvg and barstate.isconfirmed
+    if bullFvg
+        sizeVal = math.abs(high[2] - low)
+        if fvgMinSize == 0.0 or sizeVal >= fvgMinSize
+            topVal = math.max(high[2], close[2])
+            botVal = math.min(low, close)
+            box.new(bar_index - 2, topVal, bar_index + fvgExtend, botVal, border_color=color.new(color.green, 0), bgcolor=color.new(color.green, 50), extend=extend.right)
+            array.push(bullFvgTop, topVal)
+            array.push(bullFvgBot, botVal)
+            array.push(bullFvgFilled, 0.0)
+    if bearFvg
+        sizeVal = math.abs(high - low[2])
+        if fvgMinSize == 0.0 or sizeVal >= fvgMinSize
+            topVal = math.max(high, close)
+            botVal = math.min(low[2], close[2])
+            box.new(bar_index - 2, topVal, bar_index + fvgExtend, botVal, border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 50), extend=extend.right)
+            array.push(bearFvgTop, topVal)
+            array.push(bearFvgBot, botVal)
+            array.push(bearFvgFilled, 0.0)
+
+for i = 0 to array.size(bullFvgTop) - 1
+    if array.get(bullFvgFilled, i) == 0.0
+        if low <= array.get(bullFvgTop, i) and close >= array.get(bullFvgBot, i)
+            array.set(bullFvgFilled, i, 1.0)
+        else if close <= array.get(bullFvgTop, i) and close >= array.get(bullFvgBot, i)
+            fvgBullRetest := true
+
+for i = 0 to array.size(bearFvgTop) - 1
+    if array.get(bearFvgFilled, i) == 0.0
+        if high >= array.get(bearFvgBot, i) and close <= array.get(bearFvgTop, i)
+            array.set(bearFvgFilled, i, 1.0)
+        else if close >= array.get(bearFvgBot, i) and close <= array.get(bearFvgTop, i)
+            fvgBearRetest := true
+
+// ============================================================================
+// 7) POI / IMBALANCE ZONES
+// ============================================================================
+
+var float[] poiBullTop = array.new_float()
+var float[] poiBullBot = array.new_float()
+var float[] poiBearTop = array.new_float()
+var float[] poiBearBot = array.new_float()
+
+bullImbalance = (close > open) and ((high - close) > poiMinDisp or (close - low) > poiMinDisp)
+bearImbalance = (close < open) and ((open - close) > poiMinDisp or (high - close) > poiMinDisp)
+
+if showPoi and barstate.isconfirmed
+    if bullImbalance
+        zoneTop = math.max(high, open)
+        zoneBot = math.min(low, close)
+        box.new(bar_index - 1, zoneTop, bar_index + poiExtend, zoneBot, border_color=color.new(color.lime, 0), bgcolor=color.new(color.lime, 35), extend=extend.right)
+        array.push(poiBullTop, zoneTop)
+        array.push(poiBullBot, zoneBot)
+    if bearImbalance
+        zoneTop = math.max(high, open)
+        zoneBot = math.min(low, close)
+        box.new(bar_index - 1, zoneTop, bar_index + poiExtend, zoneBot, border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 35), extend=extend.right)
+        array.push(poiBearTop, zoneTop)
+        array.push(poiBearBot, zoneBot)
+
+poiBullRetest = false
+poiBearRetest = false
+
+for i = 0 to array.size(poiBullTop) - 1
+    if close <= array.get(poiBullTop, i) and close >= array.get(poiBullBot, i)
+        poiBullRetest := true
+for i = 0 to array.size(poiBearTop) - 1
+    if close >= array.get(poiBearBot, i) and close <= array.get(poiBearTop, i)
+        poiBearRetest := true
+
+// ============================================================================
+// 8) OPEN INTEREST (safe availability check only)
+// ============================================================================
+
+requestedOiSymbol = oiSymbol == "" ? syminfo.ticker : oiSymbol
+oiSeries = request.security(requestedOiSymbol, timeframe.period, close, gaps=barmerge.gap_off, lookahead=barmerge.lookahead_off)
+oiDataAvailable = not na(oiSeries)
+
+oiBullConfirm = false
+oiBearConfirm = false
+
+if useOiFilter and oiDataAvailable
+    sequence = ta.change(oiSeries)
+    oiBullConfirm := sequence > 0
+    oiBearConfirm := sequence < 0
+
+// Keep filter conservative: do not fabricate OI values.
+// If a chart does not expose a valid OI feed, OI data remains unavailable.
+
+// ============================================================================
+// 9) CONFIRMED SIGNALS
+// ============================================================================
+
+signalReady = barstate.isconfirmed and bar_index > minSignalBars
+
+liqBullConfirm = liquidityBullSweep or poiBullRetest
+liqBearConfirm = liquidityBearSweep or poiBearRetest
+
+fvgBullConfirm = fvgBullRetest or array.size(bullFvgTop) > 0
+fvgBearConfirm = fvgBearRetest or array.size(bearFvgTop) > 0
+
+buySignal = false
+sellSignal = false
+
+if signalReady
+    if signalMode == "simple"
+        buySignal := trendBull and (marketBullStructure or bullishBOS) and (liqBullConfirm or poiBullRetest) and (not requireFvgConfirm or fvgBullConfirm)
+        sellSignal := trendBear and (marketBearStructure or bearishBOS) and (liqBearConfirm or poiBearRetest) and (not requireFvgConfirm or fvgBearConfirm)
+    else
+        buySignal :=
+            trendBull and
+            (not requireBullishStructure or marketBullStructure or bullishBOS) and
+            (not requireLiquidityConfirm or liqBullConfirm) and
+            (not requireFvgConfirm or fvgBullConfirm or (allowPoiReturn and poiBullRetest)) and
+            (not useOiFilter or not oiDataAvailable or oiBullConfirm or oiMode == "mixed" or oiMode == "bullish_only")
+
+        sellSignal :=
+            trendBear and
+            (not requireBearishStructure or marketBearStructure or bearishBOS) and
+            (not requireLiquidityConfirm or liqBearConfirm) and
+            (not requireFvgConfirm or fvgBearConfirm or (allowPoiReturn and poiBearRetest)) and
+            (not useOiFilter or not oiDataAvailable or oiBearConfirm or oiMode == "mixed" or oiMode == "bearish_only")
+
+// Avoid duplicate signal labels on same candle.
+var bool lastBuyBarSignal = false
+var bool lastSellBarSignal = false
+
+if buySignal and not lastBuyBarSignal
+    lastBuyBarSignal := true
+    label.new(bar_index, low, "BUY / CALL", yloc=yloc.belowbar, color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_down, size=size.normal)
+    if alertBuy
+        alert("BUY / CALL confirmed", alert.freq_once_per_bar_close)
+else if not buySignal
+    lastBuyBarSignal := false
+
+if sellSignal and not lastSellBarSignal
+    lastSellBarSignal := true
+    label.new(bar_index, high, "SELL / PUT", yloc=yloc.abovebar, color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_up, size=size.normal)
+    if alertSell
+        alert("SELL / PUT confirmed", alert.freq_once_per_bar_close)
+else if not sellSignal
+    lastSellBarSignal := false
+
+// ============================================================================
+// 10) TRADE REFERENCE LEVELS
+// ============================================================================
+
+var bool inLong = false
+var bool inShort = false
+var float longEntry = na
+var float shortEntry = na
+var float longStop = na
+var float shortStop = na
+var float longTp = na
+var float shortTp = na
+var float longBe = na
+var float shortBe = na
+
+if buySignal and not inLong
+    inLong := true
+    inShort := false
+    longEntry := entryPrice()
+    longStop := longEntry - atr * atrStopMult
+    longTp := longEntry + (longEntry - longStop) * riskReward
+    longBe := longEntry + (longEntry - longStop) * breakEvenOffset
+if sellSignal and not inShort
+    inShort := true
+    inLong := false
+    shortEntry := entryPrice()
+    shortStop := shortEntry + atr * atrStopMult
+    shortTp := shortEntry - (shortStop - shortEntry) * riskReward
+    shortBe := shortEntry - (shortStop - shortEntry) * breakEvenOffset
+
+if showRiskLevels
+    if inLong
+        line.new(bar_index, longEntry, bar_index + 1, longEntry, color=color.new(color.lime, 0), linewidth=2, extend=extend.right)
+        line.new(bar_index, longStop, bar_index + 1, longStop, color=color.new(color.red, 0), linewidth=1, extend=extend.right)
+        line.new(bar_index, longTp, bar_index + 1, longTp, color=color.new(color.blue, 0), linewidth=1, extend=extend.right)
+        if breakEvenOffset > 0
+            line.new(bar_index, longBe, bar_index + 1, longBe, color=color.new(color.orange, 0), linewidth=1, extend=extend.right)
+        if showLevelLabels
+            label.new(bar_index, longEntry, "Entry", color=color.new(color.lime, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+            label.new(bar_index, longStop, "SL", color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+            label.new(bar_index, longTp, "TP", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    if inShort
+        line.new(bar_index, shortEntry, bar_index + 1, shortEntry, color=color.new(color.red, 0), linewidth=2, extend=extend.right)
+        line.new(bar_index, shortStop, bar_index + 1, shortStop, color=color.new(color.lime, 0), linewidth=1, extend=extend.right)
+        line.new(bar_index, shortTp, bar_index + 1, shortTp, color=color.new(color.blue, 0), linewidth=1, extend=extend.right)
+        if breakEvenOffset > 0
+            line.new(bar_index, shortBe, bar_index + 1, shortBe, color=color.new(color.orange, 0), linewidth=1, extend=extend.right)
+        if showLevelLabels
+            label.new(bar_index, shortEntry, "Entry", color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+            label.new(bar_index, shortStop, "SL", color=color.new(color.lime, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+            label.new(bar_index, shortTp, "TP", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+// ============================================================================
+// 11) BINARY EXPIRY OUTCOME REFERENCE
+// ============================================================================
+
+var float expiryRef = na
+var bool expiryLong = false
+var bool expiryShort = false
+var int expiryStartBar = na
+var bool expiryResolved = false
+var string expiryOutcome = "NONE"
+
+if buySignal
+    expiryRef := entryPrice()
+    expiryLong := true
+    expiryShort := false
+    expiryStartBar := bar_index
+    expiryResolved := false
+    expiryOutcome := "NONE"
+if sellSignal
+    expiryRef := entryPrice()
+    expiryLong := false
+    expiryShort := true
+    expiryStartBar := bar_index
+    expiryResolved := false
+    expiryOutcome := "NONE"
+
+if not na(expiryStartBar) and bar_index >= expiryStartBar + tradeExpiryBars and not expiryResolved
+    refVal = expiryPrice()
+    if expiryLong
+        expiryOutcome := refVal > expiryRef ? "CALL / ABOVE" : "PUT / BELOW"
+    if expiryShort
+        expiryOutcome := refVal < expiryRef ? "PUT / BELOW" : "CALL / ABOVE"
+    expiryResolved := true
+    if showExpiryLabels
+        label.new(bar_index, high, "Expiry: " + expiryOutcome, yloc=yloc.abovebar, color=color.new(color.purple, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// ============================================================================
+// 12) EMA PLOTS
+// ============================================================================
+
+if showEma
+    plot(ema13, color=color.new(color.lime, 0), linewidth=2, title="EMA 13")
+    plot(ema34, color=color.new(color.orange, 0), linewidth=2, title="EMA 34")
+    plot(ema200, color=color.new(color.fuchsia, 0), linewidth=1, title="EMA 200")
+
+// ============================================================================
+// 13) STATUS PANEL
+// ============================================================================
+
+var table statusTable = table.new(position.top_right, 1, 1)
+
+if showPanel
+    trendState = trendBull ? "Bull" : trendBear ? "Bear" : "Neutral"
+    structState = marketBullStructure ? "Bull BOS" : marketBearStructure ? "Bear BOS" : "Balanced"
+    liquidityState = liquidityBullSweep ? "Buy Sweep" : liquidityBearSweep ? "Sell Sweep" : "No Sweep"
+    oiState = useOiFilter and oiDataAvailable ? "OI Ready" : "OI N/A"
+    table.cell(statusTable, 0, 0, "Trend: " + trendState + "\nStruct: " + structState + "\nLiq: " + liquidityState + "\nData: " + oiState, text_color=color.white, bgcolor=color.new(color.black, 85), text_size=size.small)
+
+// ============================================================================
+// 14) ALERTS
+// ============================================================================
+
+alertcondition(buySignal and alertBuy, title="Confirmed BUY/CALL", message="BUY/CALL confirmed")
+alertcondition(sellSignal and alertSell, title="Confirmed SELL/PUT", message="SELL/PUT confirmed")
+
+// ============================================================================
+// 15) NOTES / LIMITATIONS
+// ============================================================================
+// Signals are only generated after close confirmation on a bar that has fully formed.
+// This avoids repainting and lookahead bias.
+//
+// Open interest data is not universally available in TradingView. If the selected symbol
+// does not expose a valid OI stream, the OI filter is ignored safely. This code does not
+// fabricate OI values.
+//
+// Trade levels are reference levels for chart analysis only. They do not represent an
+// actual binary option payout or an executable stop-loss / take-profit order on a broker.
+//
+// Non-repainting rule: no future data, no negative offsets, and no bar hindsight is used.
+
+// End of script.
